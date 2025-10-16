@@ -1,0 +1,9 @@
+[package]
+name = "rcp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+indicatif = "0.17.7"
+colored = "2.1.0"
+anyhow = "1.0.75"
