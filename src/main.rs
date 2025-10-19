@@ -2,14 +2,15 @@ use anyhow::{Context, Result};
 use indicatif::{MultiProgress, ProgressBar, ProgressState, ProgressStyle};
 use std::fs::{self, File};
 use std::io::{Read, Write};
+use std::os::unix::fs::symlink;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 use colored::Colorize;
 
 const BUFFER_SIZE: usize = 64 * 1024;
-const MAX_CONCURRENT_FILES: usize = 1;
+const MAX_CONCURRENT_FILES: usize = 10;
 const MAX_PATH_LENGTH: usize = 30;
 
 fn main() -> Result<()> {
@@ -38,7 +39,7 @@ fn main() -> Result<()> {
     println!("Copying {} files...", total_files);
 
     let multi_progress = MultiProgress::new();
-    let (progress_sender, progress_receiver) = std::sync::mpsc::channel();
+    let (progress_sender, progress_receiver) = mpsc::channel();
 
     // Запускаем менеджер прогресс-баров в отдельном потоке
     let manager_handle = thread::spawn({
@@ -46,31 +47,32 @@ fn main() -> Result<()> {
         move || progress_manager(progress_receiver, multi_progress, total_files)
     });
 
-    // Создаем общий Receiver для рабочих потоков
-    let (task_sender, task_receiver) = std::sync::mpsc::channel();
-    let task_receiver = Arc::new(Mutex::new(task_receiver));
+    // Распределяем файлы по рабочим потокам заранее
+    let worker_files = distribute_files_to_workers(&files_to_copy, MAX_CONCURRENT_FILES);
+    
+    // Создаем рабочие потоки
     let mut worker_handles = Vec::new();
 
-    for worker_id in 0..MAX_CONCURRENT_FILES {
-        let task_receiver = Arc::clone(&task_receiver);
+    for (worker_id, files_for_worker) in worker_files.into_iter().enumerate() {
         let progress_sender = progress_sender.clone();
+        
         let handle = thread::spawn(move || {
-            worker_loop(task_receiver, progress_sender, worker_id);
+            for (i, (source_path, dest_path)) in files_for_worker.into_iter().enumerate() {
+                let global_file_id = calculate_global_id(i, worker_id, MAX_CONCURRENT_FILES);
+                if let Err(e) = copy_item_with_progress(
+                    &source_path,
+                    &dest_path,
+                    progress_sender.clone(),
+                    global_file_id as u32,
+                ) {
+                    eprintln!("Worker {}: Error copying {}: {}", worker_id, source_path, e);
+                }
+            }
         });
         worker_handles.push(handle);
     }
 
-    // Отправляем задачи в канал
-    for (i, (source_path, dest_path)) in files_to_copy.into_iter().enumerate() {
-        task_sender.send(Task {
-            source_path,
-            dest_path,
-            file_id: i as u32,
-        })?;
-    }
-
-    // Закрываем канал задач и ждем завершения рабочих потоков
-    drop(task_sender);
+    // Ждем завершения всех рабочих потоков
     for handle in worker_handles {
         handle.join().unwrap();
     }
@@ -83,42 +85,30 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug)]
-struct Task {
-    source_path: String,
-    dest_path: std::path::PathBuf,
-    file_id: u32,
+// Распределяем файлы по рабочим потокам
+fn distribute_files_to_workers(
+    files: &[(String, std::path::PathBuf)], 
+    total_workers: usize
+) -> Vec<Vec<(String, std::path::PathBuf)>> {
+    let mut result: Vec<Vec<(String, std::path::PathBuf)>> = vec![Vec::new(); total_workers];
+    
+    for (i, (source, dest)) in files.iter().enumerate() {
+        let worker_id = i % total_workers;
+        result[worker_id].push((source.clone(), dest.clone()));
+    }
+    
+    result
 }
 
-fn worker_loop(
-    task_receiver: Arc<Mutex<std::sync::mpsc::Receiver<Task>>>,
-    progress_sender: std::sync::mpsc::Sender<ProgressUpdate>,
-    worker_id: usize,
-) {
-    loop {
-        let task = {
-            let receiver = task_receiver.lock().unwrap();
-            match receiver.recv() {
-                Ok(task) => task,
-                Err(_) => break, // Канал закрыт
-            }
-        };
-        
-        if let Err(e) = copy_file_with_progress(
-            &task.source_path,
-            &task.dest_path,
-            progress_sender.clone(),
-            task.file_id,
-        ) {
-            eprintln!("Worker {}: Error copying {}: {}", worker_id, task.source_path, e);
-        }
-    }
+// Вычисляем глобальный ID файла
+fn calculate_global_id(local_id: usize, worker_id: usize, total_workers: usize) -> usize {
+    local_id * total_workers + worker_id
 }
 
 fn collect_files(source: &Path, destination: &Path) -> Result<Vec<(String, std::path::PathBuf)>> {
     let mut files = Vec::new();
     
-    if source.is_file() {
+    if source.is_file() || source.is_symlink() {
         let source_str = source.to_string_lossy().into_owned();
         let dest_path = if destination.is_dir() {
             destination.join(source.file_name().unwrap())
@@ -146,12 +136,8 @@ fn collect_files_recursive(
         let source_path = entry.path();
         let dest_path = destination.join(entry.file_name());
 
-        if source_path.is_symlink() {
-            eprintln!("Warning: Skipping symlink: {}", source_path.display());
-            continue;
-        }
-
-        if source_path.is_file() {
+        // Включаем символические ссылки в список для копирования
+        if source_path.is_file() || source_path.is_symlink() {
             let source_str = source_path.to_string_lossy().into_owned();
             files.push((source_str, dest_path));
         } else if source_path.is_dir() {
@@ -162,10 +148,66 @@ fn collect_files_recursive(
     Ok(())
 }
 
+fn copy_item_with_progress(
+    source: &str,
+    destination: &Path,
+    progress_sender: mpsc::Sender<ProgressUpdate>,
+    file_id: u32,
+) -> Result<()> {
+    let source_path = Path::new(source);
+    
+    if source_path.is_symlink() {
+        // Копируем символическую ссылку
+        copy_symlink(source_path, destination, progress_sender, file_id)
+    } else {
+        // Копируем обычный файл
+        copy_file_with_progress(source, destination, progress_sender, file_id)
+    }
+}
+
+fn copy_symlink(
+    source: &Path,
+    destination: &Path,
+    progress_sender: mpsc::Sender<ProgressUpdate>,
+    file_id: u32,
+) -> Result<()> {
+    // Получаем цель символической ссылки
+    let target = fs::read_link(source)
+        .with_context(|| format!("Failed to read symlink: {}", source.display()))?;
+
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create parent directory: {}", parent.display()))?;
+    }
+
+    // Удаляем существующий файл/ссылку, если он есть
+    let _ = std::fs::remove_file(destination);
+
+    // Создаем новую символическую ссылку
+    symlink(&target, destination)
+        .with_context(|| format!("Failed to create symlink: {}", destination.display()))?;
+
+    // Для символических ссылок отправляем фиктивный размер и сразу завершаем
+    let _ = progress_sender.send(ProgressUpdate::NewFile {
+        path: source.to_string_lossy().into_owned(),
+        size: 1, // Фиктивный размер для прогресс-бара
+        id: file_id,
+    });
+
+    let _ = progress_sender.send(ProgressUpdate::Progress {
+        id: file_id,
+        bytes_copied: 1,
+    });
+
+    let _ = progress_sender.send(ProgressUpdate::Finished { id: file_id });
+
+    Ok(())
+}
+
 fn copy_file_with_progress(
     source: &str,
     destination: &Path,
-    progress_sender: std::sync::mpsc::Sender<ProgressUpdate>,
+    progress_sender: mpsc::Sender<ProgressUpdate>,
     file_id: u32,
 ) -> Result<()> {
     let mut source_file = File::open(source)
@@ -230,12 +272,13 @@ struct ActiveProgress {
 }
 
 fn progress_manager(
-    receiver: std::sync::mpsc::Receiver<ProgressUpdate>,
+    receiver: mpsc::Receiver<ProgressUpdate>,
     multi_progress: MultiProgress,
     total_files: usize,
 ) -> Result<()> {
     let mut active_bars: Vec<ActiveProgress> = Vec::new();
     let mut completed_files = 0;
+    let mut bars_to_remove: Vec<ProgressBar> = Vec::new();
     
     // Главный прогресс-бар для общего прогресса
     let main_pb = multi_progress.add(ProgressBar::new(total_files as u64));
@@ -247,6 +290,11 @@ fn progress_manager(
     main_pb.set_message("Overall progress".to_string());
 
     while completed_files < total_files {
+        // Сначала удаляем старые прогресс-бары
+        for pb in bars_to_remove.drain(..) {
+            multi_progress.remove(&pb);
+        }
+        
         match receiver.recv_timeout(Duration::from_millis(100)) {
             Ok(update) => {
                 match update {
@@ -255,7 +303,7 @@ fn progress_manager(
                         if active_bars.len() >= MAX_CONCURRENT_FILES {
                             if let Some(idx) = active_bars.iter().position(|ap| ap.finished) {
                                 let completed = active_bars.remove(idx);
-                                multi_progress.remove(&completed.pb);
+                                bars_to_remove.push(completed.pb);
                             }
                         }
                         
@@ -295,22 +343,17 @@ fn progress_manager(
                             completed_files += 1;
                             main_pb.inc(1);
                             
-                            // Удаляем прогресс-бар через короткое время
-                            let pb_to_remove = active_progress.pb.clone();
-                            let multi_progress_clone = multi_progress.clone();
-                            thread::spawn(move || {
-                                thread::sleep(Duration::from_secs(1));
-                                let _ = multi_progress_clone.remove(&pb_to_remove);
-                            });
+                            // Помечаем прогресс-бар для удаления в следующей итерации
+                            bars_to_remove.push(active_progress.pb.clone());
                         }
                     }
                 }
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            Err(mpsc::RecvTimeoutError::Timeout) => {
                 // Таймаут - продолжаем проверять
                 continue;
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
                 // Канал закрыт, выходим
                 break;
             }
@@ -336,28 +379,23 @@ fn shorten_path_safe(path: &str, max_length: usize) -> String {
         return path.to_string();
     }
     
-    // Преобразуем в chars для корректной работы с Unicode
     let chars: Vec<char> = path.chars().collect();
     if chars.len() <= max_length {
         return path.to_string();
     }
     
-    // Пытаемся сохранить начало и конец пути
     if chars.len() >= 3 {
-        // Ищем последний разделитель пути
         if let Some(last_sep) = path.rfind(std::path::MAIN_SEPARATOR) {
             let filename = &path[last_sep + 1..];
             let filename_chars: Vec<char> = filename.chars().collect();
             
             if filename_chars.len() + 3 <= max_length {
-                // Если имя файла короткое, показываем только его
                 return format!("...{}", filename);
             }
         }
         
-        // Показываем первые и последние символы
         let start_chars = max_length / 2;
-        let end_chars = max_length - start_chars - 3; // -3 для "..."
+        let end_chars = max_length - start_chars - 3;
         
         if start_chars > 0 && end_chars > 0 {
             let start: String = chars[..start_chars].iter().collect();
@@ -366,7 +404,6 @@ fn shorten_path_safe(path: &str, max_length: usize) -> String {
         }
     }
     
-    // Просто обрезаем с конца
     if max_length > 3 {
         let end: String = chars[chars.len() - (max_length - 3)..].iter().collect();
         format!("...{}", end)
