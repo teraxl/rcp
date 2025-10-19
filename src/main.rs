@@ -3,14 +3,14 @@ use indicatif::{MultiProgress, ProgressBar, ProgressState, ProgressStyle};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 use colored::Colorize;
-use crossbeam_channel::{bounded, Sender, Receiver};
-use rayon::prelude::*;
 
-const BUFFER_SIZE: usize = 1024 * 1024 * 1024;
-const MAX_CONCURRENT_FILES: usize = 4;
-const MAX_PATH_LENGTH: usize = 50;
+const BUFFER_SIZE: usize = 64 * 1024;
+const MAX_CONCURRENT_FILES: usize = 1;
+const MAX_PATH_LENGTH: usize = 30;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -26,31 +26,93 @@ fn main() -> Result<()> {
         anyhow::bail!("Source path does not exist: {}", source.display());
     }
 
-    let multi_progress = MultiProgress::new();
-    let (progress_sender, progress_receiver) = bounded(100);
-    let progress_sender = Arc::new(progress_sender);
-
-    // Запускаем менеджер прогресс-баров
-    let manager_handle = std::thread::spawn({
-        let multi_progress = multi_progress.clone();
-        move || progress_manager(progress_receiver, multi_progress)
-    });
-
     // Собираем все файлы для копирования
     let files_to_copy = collect_files(source, destination)?;
+    
+    if files_to_copy.is_empty() {
+        println!("No files to copy");
+        return Ok(());
+    }
 
-    // Копируем файлы с использованием пула потоков rayon
-    files_to_copy.into_par_iter().for_each(|(source_path, dest_path)| {
-        if let Err(e) = copy_file_with_progress(&source_path, &dest_path, progress_sender.clone()) {
-            eprintln!("Error copying {}: {}", source_path, e);
-        }
+    let total_files = files_to_copy.len();
+    println!("Copying {} files...", total_files);
+
+    let multi_progress = MultiProgress::new();
+    let (progress_sender, progress_receiver) = std::sync::mpsc::channel();
+
+    // Запускаем менеджер прогресс-баров в отдельном потоке
+    let manager_handle = thread::spawn({
+        let multi_progress = multi_progress.clone();
+        move || progress_manager(progress_receiver, multi_progress, total_files)
     });
+
+    // Создаем общий Receiver для рабочих потоков
+    let (task_sender, task_receiver) = std::sync::mpsc::channel();
+    let task_receiver = Arc::new(Mutex::new(task_receiver));
+    let mut worker_handles = Vec::new();
+
+    for worker_id in 0..MAX_CONCURRENT_FILES {
+        let task_receiver = Arc::clone(&task_receiver);
+        let progress_sender = progress_sender.clone();
+        let handle = thread::spawn(move || {
+            worker_loop(task_receiver, progress_sender, worker_id);
+        });
+        worker_handles.push(handle);
+    }
+
+    // Отправляем задачи в канал
+    for (i, (source_path, dest_path)) in files_to_copy.into_iter().enumerate() {
+        task_sender.send(Task {
+            source_path,
+            dest_path,
+            file_id: i as u32,
+        })?;
+    }
+
+    // Закрываем канал задач и ждем завершения рабочих потоков
+    drop(task_sender);
+    for handle in worker_handles {
+        handle.join().unwrap();
+    }
 
     // Завершаем менеджер прогресс-баров
     drop(progress_sender);
     manager_handle.join().expect("Progress manager panicked")?;
 
+    println!("{}", "Copy completed successfully!".green());
     Ok(())
+}
+
+#[derive(Debug)]
+struct Task {
+    source_path: String,
+    dest_path: std::path::PathBuf,
+    file_id: u32,
+}
+
+fn worker_loop(
+    task_receiver: Arc<Mutex<std::sync::mpsc::Receiver<Task>>>,
+    progress_sender: std::sync::mpsc::Sender<ProgressUpdate>,
+    worker_id: usize,
+) {
+    loop {
+        let task = {
+            let receiver = task_receiver.lock().unwrap();
+            match receiver.recv() {
+                Ok(task) => task,
+                Err(_) => break, // Канал закрыт
+            }
+        };
+        
+        if let Err(e) = copy_file_with_progress(
+            &task.source_path,
+            &task.dest_path,
+            progress_sender.clone(),
+            task.file_id,
+        ) {
+            eprintln!("Worker {}: Error copying {}: {}", worker_id, task.source_path, e);
+        }
+    }
 }
 
 fn collect_files(source: &Path, destination: &Path) -> Result<Vec<(String, std::path::PathBuf)>> {
@@ -103,7 +165,8 @@ fn collect_files_recursive(
 fn copy_file_with_progress(
     source: &str,
     destination: &Path,
-    progress_sender: Arc<Sender<ProgressUpdate>>,
+    progress_sender: std::sync::mpsc::Sender<ProgressUpdate>,
+    file_id: u32,
 ) -> Result<()> {
     let mut source_file = File::open(source)
         .with_context(|| format!("Failed to open source file: {}", source))?;
@@ -118,11 +181,6 @@ fn copy_file_with_progress(
 
     let mut dest_file = File::create(destination)
         .with_context(|| format!("Failed to create destination file: {}", destination.display()))?;
-
-    let file_id = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
 
     // Уведомляем о начале копирования
     let _ = progress_sender.send(ProgressUpdate::NewFile {
@@ -167,98 +225,151 @@ fn copy_file_with_progress(
 struct ActiveProgress {
     pb: ProgressBar,
     finished: bool,
-    id: u128,
+    id: u32,
     path: String,
 }
 
-fn progress_manager(receiver: Receiver<ProgressUpdate>, multi_progress: MultiProgress) -> Result<()> {
+fn progress_manager(
+    receiver: std::sync::mpsc::Receiver<ProgressUpdate>,
+    multi_progress: MultiProgress,
+    total_files: usize,
+) -> Result<()> {
     let mut active_bars: Vec<ActiveProgress> = Vec::new();
+    let mut completed_files = 0;
     
-    while let Ok(update) = receiver.recv() {
-        match update {
-            ProgressUpdate::NewFile { path, size, id } => {
-                // Удаляем старые завершенные прогресс-бары при достижении лимита
-                if active_bars.len() >= MAX_CONCURRENT_FILES {
-                    if let Some(idx) = active_bars.iter().position(|ap| ap.finished) {
-                        let completed = active_bars.remove(idx);
-                        multi_progress.remove(&completed.pb);
+    // Главный прогресс-бар для общего прогресса
+    let main_pb = multi_progress.add(ProgressBar::new(total_files as u64));
+    main_pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos:>3}/{len:>3} files ({percent}%)")?
+            .progress_chars("█▓▒░"),
+    );
+    main_pb.set_message("Overall progress".to_string());
+
+    while completed_files < total_files {
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(update) => {
+                match update {
+                    ProgressUpdate::NewFile { path, size, id } => {
+                        // Удаляем старые завершенные прогресс-бары при достижении лимита
+                        if active_bars.len() >= MAX_CONCURRENT_FILES {
+                            if let Some(idx) = active_bars.iter().position(|ap| ap.finished) {
+                                let completed = active_bars.remove(idx);
+                                multi_progress.remove(&completed.pb);
+                            }
+                        }
+                        
+                        let pb = multi_progress.add(ProgressBar::new(size));
+                        let display_path = shorten_path_safe(&path, MAX_PATH_LENGTH);
+                        
+                        pb.set_style(ProgressStyle::with_template(&format!(
+                            "{{msg:{}}} [{{elapsed_precise}}] {{bar:40.cyan/blue}} {{bytes:>8}}/{{total_bytes:>8}} {{bytes_per_sec:>10}}",
+                            MAX_PATH_LENGTH
+                        ))?
+                        .with_key("bytes_per_sec", |state: &ProgressState, w: &mut dyn std::fmt::Write| {
+                            write!(w, "{}/s", format_speed(state.per_sec())).unwrap()
+                        })
+                        .progress_chars("█▓▒░"));
+                        
+                        pb.set_message(format!("{:width$}", display_path.cyan().bold(), width = MAX_PATH_LENGTH));
+                        
+                        active_bars.push(ActiveProgress {
+                            pb,
+                            finished: false,
+                            id,
+                            path,
+                        });
+                    }
+                    ProgressUpdate::Progress { id, bytes_copied } => {
+                        if let Some(active_progress) = active_bars.iter_mut().find(|ap| ap.id == id) {
+                            if !active_progress.finished {
+                                active_progress.pb.set_position(bytes_copied);
+                            }
+                        }
+                    }
+                    ProgressUpdate::Finished { id } => {
+                        if let Some(active_progress) = active_bars.iter_mut().find(|ap| ap.id == id) {
+                            active_progress.finished = true;
+                            let display_path = shorten_path_safe(&active_progress.path, MAX_PATH_LENGTH);
+                            active_progress.pb.finish_with_message(format!("{} {}", "✓".green(), display_path));
+                            completed_files += 1;
+                            main_pb.inc(1);
+                            
+                            // Удаляем прогресс-бар через короткое время
+                            let pb_to_remove = active_progress.pb.clone();
+                            let multi_progress_clone = multi_progress.clone();
+                            thread::spawn(move || {
+                                thread::sleep(Duration::from_secs(1));
+                                let _ = multi_progress_clone.remove(&pb_to_remove);
+                            });
+                        }
                     }
                 }
-                
-                let pb = multi_progress.add(ProgressBar::new(size));
-                let display_path = shorten_path(&path, MAX_PATH_LENGTH);
-                
-                pb.set_style(ProgressStyle::with_template(&format!(
-                    "{{msg:{}}} [{{elapsed_precise}}] {{bar:40.cyan/blue}} {{bytes:>8}}/{{total_bytes:>8}} {{bytes_per_sec:>10}}",
-                    MAX_PATH_LENGTH
-                ))
-                .unwrap()
-                .with_key("bytes_per_sec", |state: &ProgressState, w: &mut dyn std::fmt::Write| {
-                    write!(w, "{}/s", format_speed(state.per_sec())).unwrap()
-                })
-                .progress_chars("█▓▒░"));
-                
-                pb.set_message(format!("{:width$}", display_path.cyan().bold(), width = MAX_PATH_LENGTH));
-                
-                active_bars.push(ActiveProgress {
-                    pb,
-                    finished: false,
-                    id,
-                    path,
-                });
             }
-            ProgressUpdate::Progress { id, bytes_copied } => {
-                if let Some(active_progress) = active_bars.iter_mut().find(|ap| ap.id == id) {
-                    if !active_progress.finished {
-                        active_progress.pb.set_position(bytes_copied);
-                    }
-                }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Таймаут - продолжаем проверять
+                continue;
             }
-            ProgressUpdate::Finished { id } => {
-                if let Some(active_progress) = active_bars.iter_mut().find(|ap| ap.id == id) {
-                    active_progress.finished = true;
-                    let display_path = shorten_path(&active_progress.path, MAX_PATH_LENGTH);
-                    active_progress.pb.finish_with_message(format!("{} {}", "✓".green(), display_path));
-                    
-                    // Запланировать удаление через 2 секунды
-                    let pb_to_remove = active_progress.pb.clone();
-                    let multi_progress = multi_progress.clone();
-                    std::thread::spawn(move || {
-                        std::thread::sleep(std::time::Duration::from_secs(2));
-                        multi_progress.remove(&pb_to_remove);
-                    });
-                }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // Канал закрыт, выходим
+                break;
             }
         }
     }
     
+    main_pb.finish_with_message("All files copied successfully!".green().to_string());
+    
     // Завершаем оставшиеся прогресс-бары
     for active_progress in active_bars {
-        let display_path = shorten_path(&active_progress.path, MAX_PATH_LENGTH);
-        active_progress.pb.finish_with_message(format!("{} {}", "✓".green(), display_path));
+        if !active_progress.finished {
+            let display_path = shorten_path_safe(&active_progress.path, MAX_PATH_LENGTH);
+            active_progress.pb.finish_with_message(format!("{} {}", "✓".green(), display_path));
+        }
     }
     
     Ok(())
 }
 
-fn shorten_path(path: &str, max_length: usize) -> String {
+// Безопасная версия shorten_path для Unicode
+fn shorten_path_safe(path: &str, max_length: usize) -> String {
     if path.len() <= max_length {
         return path.to_string();
     }
     
-    let parts: Vec<&str> = path.split(std::path::MAIN_SEPARATOR).collect();
+    // Преобразуем в chars для корректной работы с Unicode
+    let chars: Vec<char> = path.chars().collect();
+    if chars.len() <= max_length {
+        return path.to_string();
+    }
     
-    if parts.len() >= 3 {
-        let first = parts[0];
-        let last = parts[parts.len() - 1];
+    // Пытаемся сохранить начало и конец пути
+    if chars.len() >= 3 {
+        // Ищем последний разделитель пути
+        if let Some(last_sep) = path.rfind(std::path::MAIN_SEPARATOR) {
+            let filename = &path[last_sep + 1..];
+            let filename_chars: Vec<char> = filename.chars().collect();
+            
+            if filename_chars.len() + 3 <= max_length {
+                // Если имя файла короткое, показываем только его
+                return format!("...{}", filename);
+            }
+        }
         
-        if first.len() + last.len() + 3 <= max_length {
-            return format!("{}...{}", first, last);
+        // Показываем первые и последние символы
+        let start_chars = max_length / 2;
+        let end_chars = max_length - start_chars - 3; // -3 для "..."
+        
+        if start_chars > 0 && end_chars > 0 {
+            let start: String = chars[..start_chars].iter().collect();
+            let end: String = chars[chars.len() - end_chars..].iter().collect();
+            return format!("{}...{}", start, end);
         }
     }
     
+    // Просто обрезаем с конца
     if max_length > 3 {
-        format!("...{}", &path[path.len() - (max_length - 3)..])
+        let end: String = chars[chars.len() - (max_length - 3)..].iter().collect();
+        format!("...{}", end)
     } else {
         "...".to_string()
     }
@@ -282,13 +393,13 @@ enum ProgressUpdate {
     NewFile {
         path: String,
         size: u64,
-        id: u128,
+        id: u32,
     },
     Progress {
-        id: u128,
+        id: u32,
         bytes_copied: u64,
     },
     Finished {
-        id: u128,
+        id: u32,
     },
 }
